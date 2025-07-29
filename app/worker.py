@@ -1,112 +1,219 @@
 import os
-from celery import Celery
-from .notifications import notifiers
-from .database import SessionLocal
-from .models import Campaign, Recipient
-from .utils import parse_recipients
-from .services.recipient_service import RecipientService
 import logging
+from celery import Celery
+from sqlalchemy.orm import Session
+from . import models, database, notifications
+from .exceptions import NotFoundError, DatabaseError, NotificationError, CampaignError
 
-logger = logging.getLogger(__name__)
+# Configure Celery with environment variables
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/0")
 
-# Initialize Celery with Redis as broker and result backend
-# This enables asynchronous task processing for the application
-# Redis is used for both message queuing and result storage
-celery = Celery(
-    __name__,
-    broker=os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0"),
-    backend=os.environ.get("CELERY_RESULT_BACKEND", "redis://redis:6379/0"),
+# Initialize Celery app
+celery_app = Celery(
+    "campaign_manager",
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND,
+    include=["app.worker"],
 )
 
+# Configure Celery settings
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+)
 
-@celery.task
-def send_campaign_task(campaign_id: int):
+# Configure logging for Celery tasks
+logger = logging.getLogger(__name__)
+
+
+@celery_app.task(bind=True)
+def process_recipients_task(self, campaign_id: int, recipient_emails: list[str]):
     """
-    Celery task to send a campaign to all its active recipients.
+    Process recipients for a campaign asynchronously.
 
-    This task is triggered when a campaign is queued for sending.
-    It filters out opted-out recipients and sends notifications through all configured notifiers.
+    This task creates new recipients or links existing ones to a campaign.
+    It respects the opt-out flag and only processes active recipients.
 
     Args:
-        campaign_id (int): The ID of the campaign to send
+        campaign_id (int): ID of the campaign to process recipients for
+        recipient_emails (list[str]): List of recipient email addresses
 
     Returns:
-        None: Task completion is logged but no return value
+        dict: Processing result with counts and status
     """
-    db = SessionLocal()
+    logger.info(f"Starting recipient processing for campaign {campaign_id}")
+
     try:
-        # Retrieve the campaign from database
-        campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
-        if campaign:
-            # Filter out opted-out recipients - only send to active subscribers
-            active_recipients = [r for r in campaign.recipients if not r.opt_out]
-            recipient_emails = [r.email for r in active_recipients]
+        db = database.SessionLocal()
 
-            # Handle case where no active recipients exist
-            if not recipient_emails:
-                logger.warning(f"Campaign {campaign_id} has no active recipients")
-                campaign.status = "no_active_recipients"
-                db.commit()
-                return
+        # Verify campaign exists
+        campaign = (
+            db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        )
+        if not campaign:
+            raise NotFoundError("Campaign", campaign_id)
 
-            # Send campaign through all configured notifiers (email, SMS, etc.)
-            for notifier in notifiers:
-                notifier.send(campaign.title, campaign.message, recipient_emails)
+        processed_count = 0
+        skipped_count = 0
+        errors = []
 
-            # Update campaign status to sent
-            campaign.status = "sent"
-            db.commit()
-            logger.info(
-                f"Campaign {campaign_id} sent to {len(recipient_emails)} active recipients"
-            )
+        for email in recipient_emails:
+            try:
+                # Get or create recipient
+                recipient = (
+                    db.query(models.Recipient)
+                    .filter(models.Recipient.email == email)
+                    .first()
+                )
+                if not recipient:
+                    recipient = models.Recipient(email=email, opt_out=False)
+                    db.add(recipient)
+                    logger.info(f"Created new recipient: {email}")
+                else:
+                    logger.info(f"Found existing recipient: {email}")
+
+                # Only add to campaign if not opted out
+                if not recipient.opt_out:
+                    # Check if already linked to campaign
+                    if recipient not in campaign.recipients:
+                        campaign.recipients.append(recipient)
+                        processed_count += 1
+                        logger.info(
+                            f"Added recipient {email} to campaign {campaign_id}"
+                        )
+                    else:
+                        logger.info(
+                            f"Recipient {email} already in campaign {campaign_id}"
+                        )
+                else:
+                    skipped_count += 1
+                    logger.warning(f"Skipped opted-out recipient: {email}")
+
+            except Exception as e:
+                error_msg = f"Error processing recipient {email}: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+        # Update campaign status
+        campaign.status = "recipients_processed"
+        db.commit()
+
+        result = {
+            "campaign_id": campaign_id,
+            "processed_count": processed_count,
+            "skipped_count": skipped_count,
+            "error_count": len(errors),
+            "errors": errors,
+            "status": "completed",
+        }
+
+        logger.info(
+            f"Recipient processing completed for campaign {campaign_id}: {result}"
+        )
+        return result
+
+    except NotFoundError:
+        logger.error(f"Campaign {campaign_id} not found")
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error processing recipients for campaign {campaign_id}: {str(e)}"
+        )
+        raise CampaignError(
+            f"Failed to process recipients: {str(e)}", campaign_id, "process_recipients"
+        )
     finally:
         db.close()
 
 
-@celery.task
-def process_recipients_task(campaign_id: int, recipient_emails: list[str]):
+@celery_app.task(bind=True)
+def send_campaign_task(self, campaign_id: int):
     """
-    Celery task to process and link recipients to a campaign.
+    Send a campaign to all its active recipients asynchronously.
 
-    This task runs asynchronously when a campaign is created.
-    It handles recipient creation, deduplication, and linking to the campaign.
-    Only active (non-opted-out) recipients are linked to the campaign.
+    This task retrieves all recipients for a campaign, filters out opted-out recipients,
+    and sends the campaign message to each active recipient.
 
     Args:
-        campaign_id (int): The ID of the campaign to link recipients to
-        recipient_emails (list[str]): List of email addresses to process
+        campaign_id (int): ID of the campaign to send
 
     Returns:
-        None: Task completion is logged but no return value
+        dict: Sending result with counts and status
     """
-    db = SessionLocal()
+    logger.info(f"Starting campaign sending for campaign {campaign_id}")
+
     try:
-        # Retrieve the campaign from database
-        campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+        db = database.SessionLocal()
+
+        # Get campaign with recipients
+        campaign = (
+            db.query(models.Campaign).filter(models.Campaign.id == campaign_id).first()
+        )
         if not campaign:
-            logger.error(f"Campaign {campaign_id} not found")
-            return
+            raise NotFoundError("Campaign", campaign_id)
 
-        # Process each recipient email
-        recipients = []
-        for email in recipient_emails:
-            # Get or create recipient (handles deduplication)
-            recipient = RecipientService.get_or_create_recipient(db, email)
-            # Only add if not opted out
-            if not recipient.opt_out:
-                recipients.append(recipient)
-            else:
-                logger.info(f"Skipping opted-out recipient: {email}")
+        # Get active recipients (not opted out)
+        active_recipients = [r for r in campaign.recipients if not r.opt_out]
 
-        # Link only active recipients to the campaign
-        campaign.recipients = recipients
+        if not active_recipients:
+            logger.warning(f"No active recipients found for campaign {campaign_id}")
+            campaign.status = "sent_no_recipients"
+            db.commit()
+            return {
+                "campaign_id": campaign_id,
+                "sent_count": 0,
+                "error_count": 0,
+                "status": "completed_no_recipients",
+            }
+
+        sent_count = 0
+        error_count = 0
+        errors = []
+
+        # Send to each active recipient
+        for recipient in active_recipients:
+            try:
+                # Use the email notifier to send the campaign
+                notifiers["email"].send(
+                    to_email=recipient.email,
+                    subject=campaign.title,
+                    message=campaign.message,
+                )
+                sent_count += 1
+                logger.info(f"Sent campaign {campaign_id} to {recipient.email}")
+
+            except Exception as e:
+                error_msg = f"Error sending to {recipient.email}: {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                error_count += 1
+                continue
+
+        # Update campaign status
+        campaign.status = "sent"
         db.commit()
 
-        logger.info(
-            f"Processed {len(recipients)} active recipients for campaign {campaign_id}"
-        )
+        result = {
+            "campaign_id": campaign_id,
+            "sent_count": sent_count,
+            "error_count": error_count,
+            "errors": errors,
+            "status": "completed",
+        }
+
+        logger.info(f"Campaign sending completed for campaign {campaign_id}: {result}")
+        return result
+
+    except NotFoundError:
+        logger.error(f"Campaign {campaign_id} not found")
+        raise
     except Exception as e:
-        logger.error(f"Error processing recipients for campaign {campaign_id}: {e}")
-        db.rollback()
+        logger.error(f"Error sending campaign {campaign_id}: {str(e)}")
+        raise CampaignError(f"Failed to send campaign: {str(e)}", campaign_id, "send")
     finally:
         db.close()

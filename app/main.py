@@ -1,10 +1,19 @@
 import logging
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
 from . import models, schemas, database, utils
 from .notifications import notifiers
 from .worker import send_campaign_task, process_recipients_task
 from .services.recipient_service import RecipientService
+from .middleware.error_handler import error_handler_middleware
+from .exceptions import (
+    NotFoundError,
+    DuplicateError,
+    DatabaseError,
+    CampaignError,
+    RecipientError,
+    GroupError,
+)
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -35,6 +44,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add custom error handling middleware
+app.middleware("http")(error_handler_middleware)
 
 
 def get_db():
@@ -74,20 +86,24 @@ def create_campaign(campaign: schemas.CampaignCreate, db: Session = Depends(get_
     Returns:
         dict: Campaign data with processing status
     """
-    # Create campaign without recipients first for immediate response
-    db_campaign = models.Campaign(title=campaign.title, message=campaign.message)
-    db.add(db_campaign)
-    db.commit()
-    db.refresh(db_campaign)
+    try:
+        # Create campaign without recipients first for immediate response
+        db_campaign = models.Campaign(title=campaign.title, message=campaign.message)
+        db.add(db_campaign)
+        db.commit()
+        db.refresh(db_campaign)
 
-    # Process recipients asynchronously in the background
-    process_recipients_task.delay(db_campaign.id, campaign.recipient_emails)
+        # Process recipients asynchronously in the background
+        process_recipients_task.delay(db_campaign.id, campaign.recipient_emails)
 
-    return {
-        **db_campaign.__dict__,
-        "recipient_emails": campaign.recipient_emails,
-        "recipients": [],
-    }
+        return {
+            **db_campaign.__dict__,
+            "recipient_emails": campaign.recipient_emails,
+            "recipients": [],
+        }
+    except Exception as e:
+        db.rollback()
+        raise CampaignError(f"Failed to create campaign: {str(e)}", operation="create")
 
 
 @app.get("/campaigns/", response_model=list[schemas.CampaignRead])
@@ -101,22 +117,25 @@ def list_campaigns(db: Session = Depends(get_db)):
     Returns:
         list: List of all campaigns with recipient information
     """
-    campaigns = db.query(models.Campaign).all()
-    result = []
-    for c in campaigns:
-        # Use ORM mode conversion for proper schema validation
-        campaign_data = {
-            "id": c.id,
-            "title": c.title,
-            "message": c.message,
-            "status": c.status,
-            "created_at": c.created_at,
-            "updated_at": c.updated_at,
-            "recipient_emails": [r.email for r in c.recipients],
-            "recipients": c.recipients,  # Let Pydantic handle the conversion
-        }
-        result.append(campaign_data)
-    return result
+    try:
+        campaigns = db.query(models.Campaign).all()
+        result = []
+        for c in campaigns:
+            # Use ORM mode conversion for proper schema validation
+            campaign_data = {
+                "id": c.id,
+                "title": c.title,
+                "message": c.message,
+                "status": c.status,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+                "recipient_emails": [r.email for r in c.recipients],
+                "recipients": c.recipients,  # Let Pydantic handle the conversion
+            }
+            result.append(campaign_data)
+        return result
+    except Exception as e:
+        raise DatabaseError(f"Failed to list campaigns: {str(e)}", "list_campaigns")
 
 
 @app.post("/campaigns/send")
@@ -133,19 +152,24 @@ def send_campaign(req: schemas.CampaignSendRequest, db: Session = Depends(get_db
 
     Returns:
         dict: Status confirmation with campaign ID
-
-    Raises:
-        HTTPException: If campaign is not found
     """
-    campaign = db.query(models.Campaign).filter(models.Campaign.id == req.id).first()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        campaign = (
+            db.query(models.Campaign).filter(models.Campaign.id == req.id).first()
+        )
+        if not campaign:
+            raise NotFoundError("Campaign", req.id)
 
-    # Queue the campaign for sending in the background
-    send_campaign_task.delay(campaign.id)
-    campaign.status = "queued"
-    db.commit()
-    return {"status": "queued", "campaign_id": campaign.id}
+        # Queue the campaign for sending in the background
+        send_campaign_task.delay(campaign.id)
+        campaign.status = "queued"
+        db.commit()
+        return {"status": "queued", "campaign_id": campaign.id}
+    except NotFoundError:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise CampaignError(f"Failed to send campaign: {str(e)}", req.id, "send")
 
 
 # =============================================================================
@@ -165,8 +189,10 @@ def create_group(group: schemas.GroupCreate, db: Session = Depends(get_db)):
     Returns:
         schemas.GroupRead: Created group data
     """
-    db_group = RecipientService.get_or_create_group(db, group.name, group.description)
-    return db_group
+    try:
+        return RecipientService.get_or_create_group(db, group.name, group.description)
+    except (DuplicateError, DatabaseError):
+        raise
 
 
 @app.get("/groups/", response_model=list[schemas.GroupRead])
@@ -180,7 +206,10 @@ def list_groups(db: Session = Depends(get_db)):
     Returns:
         list: List of all groups
     """
-    return db.query(models.Group).all()
+    try:
+        return db.query(models.Group).all()
+    except Exception as e:
+        raise DatabaseError(f"Failed to list groups: {str(e)}", "list_groups")
 
 
 @app.patch("/groups/{group_id}", response_model=schemas.GroupRead)
@@ -197,16 +226,13 @@ def update_group(
 
     Returns:
         schemas.GroupRead: Updated group data
-
-    Raises:
-        HTTPException: If group is not found
     """
     try:
         return RecipientService.update_group(
             db, group_id, group_update.name, group_update.description
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except (NotFoundError, DuplicateError, GroupError):
+        raise
 
 
 @app.patch("/groups/{group_id}/recipients", response_model=list[schemas.RecipientRead])
@@ -228,16 +254,13 @@ def add_recipients_to_group(
 
     Returns:
         list: List of added recipients
-
-    Raises:
-        HTTPException: If group is not found
     """
     try:
         return RecipientService.add_recipients_to_group_patch(
             db, group_id, group_recipients.recipient_emails
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except (NotFoundError, GroupError):
+        raise
 
 
 # =============================================================================
@@ -260,13 +283,16 @@ def create_recipient(recipient: schemas.RecipientCreate, db: Session = Depends(g
     Returns:
         schemas.RecipientRead: Created or existing recipient data
     """
-    db_recipient = RecipientService.get_or_create_recipient(
-        db, recipient.email, recipient.name
-    )
-    if recipient.group_id:
-        db_recipient.group_id = recipient.group_id
-        db.commit()
-    return db_recipient
+    try:
+        db_recipient = RecipientService.get_or_create_recipient(
+            db, recipient.email, recipient.name
+        )
+        if recipient.group_id:
+            db_recipient.group_id = recipient.group_id
+            db.commit()
+        return db_recipient
+    except (DuplicateError, DatabaseError, RecipientError):
+        raise
 
 
 @app.get("/recipients/", response_model=list[schemas.RecipientRead])
@@ -281,7 +307,10 @@ def list_recipients(db: Session = Depends(get_db), include_opted_out: bool = Fal
     Returns:
         list: List of recipients
     """
-    return RecipientService.get_all_recipients(db, include_opted_out)
+    try:
+        return RecipientService.get_all_recipients(db, include_opted_out)
+    except DatabaseError:
+        raise
 
 
 @app.patch("/recipients/{recipient_id}", response_model=schemas.RecipientRead)
@@ -300,9 +329,6 @@ def update_recipient(
 
     Returns:
         schemas.RecipientRead: Updated recipient data
-
-    Raises:
-        HTTPException: If recipient is not found
     """
     try:
         return RecipientService.update_recipient(
@@ -312,8 +338,8 @@ def update_recipient(
             recipient_update.group_id,
             recipient_update.opt_out,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except (NotFoundError, RecipientError):
+        raise
 
 
 @app.post("/recipients/opt-out", response_model=schemas.RecipientRead)
@@ -331,7 +357,10 @@ def opt_out_recipient(opt_out: schemas.RecipientOptOut, db: Session = Depends(ge
     Returns:
         schemas.RecipientRead: Updated recipient data
     """
-    return RecipientService.opt_out_recipient(db, opt_out.email, opt_out.reason)
+    try:
+        return RecipientService.opt_out_recipient(db, opt_out.email, opt_out.reason)
+    except RecipientError:
+        raise
 
 
 @app.post("/recipients/opt-in", response_model=schemas.RecipientRead)
@@ -349,7 +378,10 @@ def opt_in_recipient(opt_in: schemas.RecipientOptIn, db: Session = Depends(get_d
     Returns:
         schemas.RecipientRead: Updated recipient data
     """
-    return RecipientService.opt_in_recipient(db, opt_in.email)
+    try:
+        return RecipientService.opt_in_recipient(db, opt_in.email)
+    except RecipientError:
+        raise
 
 
 @app.get("/recipients/active", response_model=list[schemas.RecipientRead])
@@ -365,7 +397,10 @@ def list_active_recipients(db: Session = Depends(get_db)):
     Returns:
         list: List of active recipients
     """
-    return RecipientService.get_active_recipients(db)
+    try:
+        return RecipientService.get_active_recipients(db)
+    except DatabaseError:
+        raise
 
 
 @app.get("/groups/{group_id}/recipients", response_model=list[schemas.RecipientRead])
@@ -383,4 +418,7 @@ def list_group_recipients(
     Returns:
         list: List of recipients in the group
     """
-    return RecipientService.get_recipients_by_group(db, group_id, active_only)
+    try:
+        return RecipientService.get_recipients_by_group(db, group_id, active_only)
+    except DatabaseError:
+        raise
